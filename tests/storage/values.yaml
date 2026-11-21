@@ -1,0 +1,2 @@
+# storageClass is intentionally empty: the chart then relies on a default StorageClass.
+storageClass: ""

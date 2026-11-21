@@ -1,0 +1,443 @@
+#!/usr/bin/env bash
+# supervisor-preflight: pre-flight validation of a Helm chart for a vSphere Supervisor namespace.
+# Checks RBAC, admission (webhooks, policies, Pod Security), and storage for the current identity,
+# and can deploy the chart if every check passes.
+# Requires: bash 4+, kubectl, helm 3.13+, jq, yq (mikefarah v4).
+# Read-only: nothing is persisted on the cluster.
+# Exit codes: 0 pass (and deployed, with --deploy), 1 denied/unsupported/dry-run failed,
+# 2 tool error, 3 checks passed but the deployment itself failed.
+set -uo pipefail
+
+usage() {
+  cat <<EOF
+Usage: ${0##*/} <chart> <release> [-n namespace] [-f values.yaml]... [--set k=v]...
+                [--version V] [--upgrade] [--kube-context CTX] [--skip-dry-run] [--json]
+                [--deploy]   deploy the chart for real if, and only if, the result is PASS
+EOF
+  exit 2
+}
+
+NS=demo1; VALUES=(); SETS=(); VERSION=""; UPGRADE=0; CTX=""; SKIP_DRY=0; JSON=0; DEPLOY=0; POS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--namespace) NS=${2:?}; shift 2 ;;
+    -f|--values) VALUES+=("${2:?}"); shift 2 ;;
+    --set) SETS+=("${2:?}"); shift 2 ;;
+    --version) VERSION=${2:?}; shift 2 ;;
+    --upgrade) UPGRADE=1; shift ;;
+    --kube-context) CTX=${2:?}; shift 2 ;;
+    --skip-dry-run) SKIP_DRY=1; shift ;;
+    --deploy) DEPLOY=1; shift ;;
+    --json) JSON=1; shift ;;
+    -h|--help) usage ;;
+    -*) echo "unknown option: $1" >&2; usage ;;
+    *) POS+=("$1"); shift ;;
+  esac
+done
+[[ ${#POS[@]} -eq 2 ]] || usage
+[[ $DEPLOY -eq 1 && $SKIP_DRY -eq 1 ]] && { echo "ERROR: --deploy needs the server-side validation; remove --skip-dry-run" >&2; exit 2; }
+CHART=${POS[0]}; RELEASE=${POS[1]}
+
+for t in kubectl helm jq yq; do
+  command -v "$t" >/dev/null || { echo "ERROR: $t not found" >&2; exit 2; }
+done
+
+KUBECTL=(kubectl); HELM_CTX=()
+[[ -n $CTX ]] && { KUBECTL+=(--context "$CTX"); HELM_CTX=(--kube-context "$CTX"); }
+
+HELM_ARGS=()
+for f in ${VALUES[@]+"${VALUES[@]}"}; do HELM_ARGS+=(-f "$f"); done
+for s in ${SETS[@]+"${SETS[@]}"}; do HELM_ARGS+=(--set "$s"); done
+[[ -n $VERSION ]] && HELM_ARGS+=(--version "$VERSION")
+
+if [[ $UPGRADE -eq 1 ]]; then VERBS=(create get patch update delete); else VERBS=(create); fi
+RELEASE_SECRET_VERBS=(create get list update delete)
+
+declare -A DISC RULES UNSUP CHART_ROLES CHART_CRDS FROMCRD
+N_FROMCRD=0
+SC_LISTABLE=0; SC_HAS_DEFAULT=0; SC_NAMES=""
+RESULTS=()        # tab-separated: resource ns verb status note
+SERVER_RESULTS=() # tab-separated: resource ns result category message
+
+add() { RESULTS+=("$(printf '%s\t%s\t%s\t%s\t%s' "$1" "$2" "$3" "$4" "${5:-}")"); }
+
+die() { echo "ERROR: $*" >&2; exit 2; }
+
+whoami_user() {
+  "${KUBECTL[@]}" auth whoami -o json 2>/dev/null | jq -r '.status.userInfo.username' 2>/dev/null || echo unknown
+}
+
+# discovery <apiVersion> -> JSON array of {name,kind,namespaced}, or "NONE"
+discovery() {
+  local av=$1 path
+  if [[ -z ${DISC[$av]+x} ]]; then
+    [[ $av == */* ]] && path=/apis/$av || path=/api/$av
+    local out
+    if out=$("${KUBECTL[@]}" get --raw "$path" 2>/dev/null); then
+      DISC[$av]=$(jq -c '[.resources[] | select(.name | contains("/") | not) | {name,kind,namespaced}]' <<<"$out")
+    else
+      DISC[$av]=NONE
+    fi
+  fi
+  printf '%s' "${DISC[$av]}"
+}
+
+# rules <namespace> -> resourceRules JSON array ("[]" when unavailable)
+rules() {
+  local ns=$1
+  if [[ -z ${RULES[$ns]+x} ]]; then
+    local review out
+    review=$(jq -nc --arg ns "$ns" '{apiVersion:"authorization.k8s.io/v1",kind:"SelfSubjectRulesReview",spec:{namespace:$ns}}')
+    if out=$("${KUBECTL[@]}" create --raw /apis/authorization.k8s.io/v1/selfsubjectrulesreviews -f - <<<"$review" 2>/dev/null); then
+      RULES[$ns]=$(jq -c '.status.resourceRules // []' <<<"$out")
+    else
+      RULES[$ns]='[]'
+    fi
+  fi
+  printf '%s' "${RULES[$ns]}"
+}
+
+rule_allows() { # rules verb group resource name
+  jq -e --arg v "$2" --arg g "$3" --arg r "$4" --arg n "$5" '
+    any(.[];
+      ((.verbs // []) | any(. == $v or . == "*")) and
+      ((.apiGroups // []) | any(. == $g or . == "*")) and
+      ((.resources // []) | any(. == $r or . == "*")) and
+      (((.resourceNames // []) | length == 0) or ($v != "create" and ((.resourceNames | index($n)) != null))))
+  ' <<<"$1" >/dev/null 2>&1
+}
+
+can_i() { # verb resource group namespace(or "") name(or "")
+  local verb=$1 res=$2 group=$3 ns=$4 name=$5 target
+  target=$res; [[ -n $group ]] && target=$res.$group
+  [[ -n $name && $verb != create ]] && target=$target/$name
+  local cmd=("${KUBECTL[@]}" auth can-i "$verb" "$target")
+  [[ -n $ns ]] && cmd+=(-n "$ns")
+  [[ $("${cmd[@]}" 2>/dev/null) == yes* ]]
+}
+
+# decide verb resource group ns name namespaced(true|false)
+decide() {
+  local verb=$1 res=$2 group=$3 ns=$4 name=$5 namespaced=$6
+  if [[ $namespaced == true ]]; then
+    rule_allows "$(rules "$ns")" "$verb" "$group" "$res" "$name" && return 0
+    can_i "$verb" "$res" "$group" "$ns" "$name"
+  else
+    can_i "$verb" "$res" "$group" "" "$name"
+  fi
+}
+
+st() { "$@" && echo ALLOWED || echo DENIED; }
+
+escalation() { # kind name ns doc namespaced
+  local kind=$1 name=$2 ns=$3 doc=$4 namespaced=$5 label="$1/$2" plural scope_ns
+  plural=$(tr '[:upper:]' '[:lower:]' <<<"${kind}s")
+  scope_ns=$ns; [[ $namespaced == true ]] || scope_ns=-
+  case $kind in
+    Role|ClusterRole)
+      decide escalate "$plural" rbac.authorization.k8s.io "$ns" "$name" "$namespaced" && return 0
+      local missing=() v res g
+      while IFS=$'\t' read -r v res g; do
+        [[ -z $v ]] && continue
+        decide "$v" "$res" "$g" "$ns" "" "$namespaced" || missing+=("$v $res${g:+.$g}")
+      done < <(jq -r '(.rules // [])[] | . as $r | ($r.apiGroups // [""])[] as $g
+                      | ($r.resources // [])[] as $res | ($r.verbs // [])[] as $v
+                      | [$v,$res,$g] | @tsv' <<<"$doc")
+      if [[ ${#missing[@]} -gt 0 ]]; then
+        local list; list=$(printf '%s\n' "${missing[@]}" | sort -u | head -6 | paste -sd, - | sed 's/,/, /g')
+        add "$label" "$scope_ns" escalate-check DENIED "cannot grant permissions it does not hold: $list"
+      else
+        add "$label" "$scope_ns" escalate-check ALLOWED "holds every permission being granted"
+      fi ;;
+    RoleBinding|ClusterRoleBinding)
+      local rkind rname rplural
+      rkind=$(jq -r '.roleRef.kind // "ClusterRole"' <<<"$doc"); rname=$(jq -r '.roleRef.name' <<<"$doc")
+      rplural=$(tr '[:upper:]' '[:lower:]' <<<"${rkind}s")
+      if decide bind "$rplural" rbac.authorization.k8s.io "$ns" "$rname" "$namespaced"; then
+        add "$label" "$scope_ns" bind-check ALLOWED "bind on $rkind/$rname allowed"
+      else
+        add "$label" "$scope_ns" bind-check WARN "bind on $rkind/$rname not held; works only if you already hold all of that role's permissions"
+      fi ;;
+  esac
+}
+
+# classify <error text> -> category of the API server / admission error
+classify() {
+  local t=$1
+  if   grep -qiE 'does not support dry.?run' <<<"$t"; then echo WEBHOOK-NO-DRYRUN
+  elif grep -qiE 'admission webhook .* denied|denied the request' <<<"$t"; then echo WEBHOOK
+  elif grep -qiE 'ValidatingAdmissionPolicy' <<<"$t"; then echo ADMISSION-POLICY
+  elif grep -qiE 'exceeded quota' <<<"$t"; then echo QUOTA
+  elif grep -qiE 'violat(es|e) PodSecurity' <<<"$t"; then echo POD-SECURITY
+  elif grep -qiE 'is forbidden' <<<"$t"; then echo RBAC
+  elif grep -qiE 'already exists|AlreadyExists|exists and cannot be imported|invalid ownership metadata' <<<"$t"; then echo CONFLICT
+  elif grep -qiE 'no matches for kind|resource mapping not found|ensure CRDs' <<<"$t"; then echo MISSING-CRD
+  elif grep -qiE 'is invalid|Invalid value|unknown field|strict decoding' <<<"$t"; then echo INVALID
+  else echo OTHER
+  fi
+}
+
+# clean_err: drop kubectl's temp-file prefix and the error class
+clean_err() { sed -E 's/error when (creating|applying) "[^"]*": ?//; s/^Error from server( \([A-Za-z]+\))?: //; s/^Error: //'; }
+
+add_srv() { SERVER_RESULTS+=("$(printf '%s\t%s\t%s\t%s\t%s' "$1" "$2" "$3" "$4" "${5:-}")"); }
+
+# pvc_checks <file> <kind> <name> <ns>: StorageClass checks for PVCs and for the volumeClaimTemplates
+# of a StatefulSet. A PVC without a StorageClass is rejected when it is really created (this
+# Supervisor has no default class) but accepted by a dry-run, and a StatefulSet only creates its PVCs
+# after it is deployed, so both cases are checked here: statically against the cluster's StorageClasses,
+# then (install mode, StatefulSets) by dry-running each template as a PVC, which also catches classes
+# that exist but are not assigned to the namespace.
+pvc_checks() {
+  local f=$1 kind=$2 name=$3 ns=$4 filter idx tname sc vol label pvcname out rc errtxt cat avail
+  case $kind in
+    StatefulSet) filter='(.spec.volumeClaimTemplates // []) | to_entries[] | [.key, .value.metadata.name,
+        (.value.spec.storageClassName | if . == null then "__unset__" elif . == "" then "__empty__" else . end),
+        (.value.spec.volumeName // "-")] | @tsv' ;;
+    PersistentVolumeClaim) filter='[0, .metadata.name,
+        (.spec.storageClassName | if . == null then "__unset__" elif . == "" then "__empty__" else . end),
+        (.spec.volumeName // "-")] | @tsv' ;;
+    *) return ;;
+  esac
+  local total; total=$(grep -c . <<<"$SC_NAMES")
+  avail=$(head -3 <<<"$SC_NAMES" | paste -sd, - | sed 's/,/, /g')
+  [[ $total -gt 3 ]] && avail="$avail, ... ($total in total; list them with: kubectl get storageclass)"
+  while IFS=$'\t' read -r idx tname sc vol; do
+    [[ -n $tname ]] || continue
+    if [[ $kind == StatefulSet ]]; then
+      pvcname="$tname-$name-0"; label="PVC/$pvcname (volumeClaimTemplate of StatefulSet/$name)"
+    else
+      pvcname=$tname; label="PersistentVolumeClaim/$name (storage class)"
+    fi
+    local res=OK cat_=- msg=""
+    if [[ $sc == __empty__ || $vol != - ]]; then
+      msg="statically bound; no StorageClass needed"
+    elif [[ $sc == __unset__ ]]; then
+      if [[ $SC_LISTABLE -eq 0 ]]; then
+        res=WARN; cat_=STORAGECLASS; msg="no StorageClass is set and the cluster's StorageClasses could not be listed; not checked"
+      elif [[ $SC_HAS_DEFAULT -eq 1 ]]; then
+        msg="uses the cluster's default StorageClass"
+      else
+        res=DENIED; cat_=STORAGECLASS
+        msg="no StorageClass is set and the cluster has no default, so the PVC is rejected when created; set one in the chart values (available: $avail)"
+      fi
+    elif [[ $SC_LISTABLE -eq 1 ]] && ! grep -qxF -- "$sc" <<<"$SC_NAMES"; then
+      res=DENIED; cat_=STORAGECLASS; msg="StorageClass '$sc' does not exist (available: $avail)"
+    else
+      msg="StorageClass $sc"
+    fi
+    if [[ $res == OK && $kind == StatefulSet && $UPGRADE -eq 0 ]]; then
+      out=$(yq -o=json -I0 '.' "$f" 2>/dev/null | jq -c --argjson i "$idx" --arg ns "$ns" --arg n "$pvcname" '
+              .spec.volumeClaimTemplates[$i] | {apiVersion: "v1", kind: "PersistentVolumeClaim",
+              metadata: {name: $n, namespace: $ns, labels: (.metadata.labels // {})}, spec: .spec}' \
+            | "${KUBECTL[@]}" create --dry-run=server -f - -o name 2>&1); rc=$?
+      if [[ $rc -eq 0 ]]; then
+        msg="$msg; accepted as a PVC (dry-run)"
+      else
+        errtxt=$(grep -v '^Warning:' <<<"$out" | tr '\n' ' ' | sed -E 's/  +/ /g; s/ $//')
+        cat=$(classify "$errtxt"); errtxt=$(clean_err <<<"$errtxt")
+        if [[ $cat == WEBHOOK-NO-DRYRUN ]]; then res=WARN; else res=DENIED; fi
+        cat_=$cat; msg="$errtxt"
+      fi
+    fi
+    add_srv "$label" "$ns" "$res" "$cat_" "$msg"
+  done < <(yq -o=json -I0 '.' "$f" 2>/dev/null | jq -r "$filter")
+}
+
+# server_check_all <dir>: server-side dry-run of every object on its own (the original YAML,
+# one file per document, so values like 0755 survive), so one denial does not hide the others.
+# Runs the full admission chain (webhooks, policies, quota, Pod Security).
+server_check_all() {
+  local dir=$1 f meta kind name dns hasns hook rref label sub out rc errtxt cat line args
+  if [[ $UPGRADE -eq 1 ]]; then sub=apply; else sub=create; fi
+  while IFS= read -r f; do
+    meta=$(yq -o=json -I0 '.' "$f" 2>/dev/null | jq -r --arg ns "$NS" '
+      select(type == "object" and .kind != null) |
+      [.kind, (.metadata.name // "?"), (.metadata.namespace // $ns),
+       (if .metadata.namespace then "y" else "n" end),
+       (.metadata.annotations["helm.sh/hook"] // "-"),
+       (if .roleRef then "\(.roleRef.kind)/\(.roleRef.name)" else "-" end)] | @tsv')
+    [[ -n $meta ]] || continue
+    IFS=$'\t' read -r kind name dns hasns hook rref <<<"$meta"
+    label="$kind/$name"; [[ $hook != - ]] && label="$label (hook: $hook)"
+    if [[ -n ${UNSUP[$kind/$name]+x} ]]; then
+      add_srv "$label" "$dns" SKIPPED UNSUPPORTED "kind not served by this Supervisor (see static check)"
+      continue
+    fi
+    if [[ -n ${FROMCRD[$kind/$name]+x} ]]; then
+      add_srv "$label" "$dns" SKIPPED DEPENDENCY "kind comes from a CRD in this chart, which a dry-run does not create; RBAC was checked"
+      continue
+    fi
+    args=("$sub" --dry-run=server -f "$f" -o name)
+    [[ $hasns == n ]] && args+=(-n "$NS")
+    out=$("${KUBECTL[@]}" "${args[@]}" 2>&1); rc=$?
+    if [[ $rc -eq 0 ]]; then
+      add_srv "$label" "$dns" OK - ""
+    else
+      errtxt=$(grep -v '^Warning:' <<<"$out" | tr '\n' ' ' | sed -E 's/  +/ /g; s/ $//')
+      cat=$(classify "$errtxt")
+      errtxt=$(clean_err <<<"$errtxt")
+      local sa; sa=$(sed -nE 's/.*error looking up service account [^\/]+\/([^:]+):.*/\1/p' <<<"$errtxt")
+      if [[ $cat == WEBHOOK-NO-DRYRUN ]]; then
+        add_srv "$label" "$dns" WARN "$cat" "$errtxt"
+      elif [[ $rref != - && -n ${CHART_ROLES[$rref]+x} ]] && grep -qi 'not found' <<<"$errtxt"; then
+        add_srv "$label" "$dns" WARN DEPENDENCY "needs $rref from this chart, which a dry-run does not create; not checked"
+      elif [[ -n $sa && -n ${CHART_ROLES[ServiceAccount/$sa]+x} ]]; then
+        add_srv "$label" "$dns" WARN DEPENDENCY "needs ServiceAccount/$sa from this chart, which a dry-run does not create; not checked"
+      else
+        add_srv "$label" "$dns" DENIED "$cat" "$errtxt"
+      fi
+    fi
+    while IFS= read -r line; do   # non-blocking admission warnings (e.g. Pod Security)
+      [[ $line == Warning:* ]] || continue
+      add_srv "$label" "$dns" WARN "$(classify "$line")" "${line#Warning: }"
+    done <<<"$out"
+    pvc_checks "$f" "$kind" "$name" "$dns"
+  done < <(find "$dir" -name 'doc_*.yml' | sort -V)
+}
+
+fmt_table() { # reads TSV (5 fields) on stdin; left-aligns the first four
+  awk -F'\t' '{ for (i=1;i<=4;i++) { if (length($i)>w[i]) w[i]=length($i) } row[NR]=$0 }
+    END { for (n=1;n<=NR;n++) { split(row[n], f, "\t");
+          printf "%-*s  %-*s  %-*s  %-*s  %s\n", w[1],f[1], w[2],f[2], w[3],f[3], w[4],f[4], f[5] } }'
+}
+
+# ---- main ----
+TMPDIR_=$(mktemp -d); trap 'rm -rf "$TMPDIR_"' EXIT
+
+# Preflight: can we reach the cluster, and does the namespace exist?
+"${KUBECTL[@]}" get --raw /version >/dev/null 2>"$TMPDIR_/ping.err" \
+  || die "cannot reach the cluster with kube context '${CTX:-<current>}': $(head -c 300 "$TMPDIR_/ping.err")"
+if nsout=$("${KUBECTL[@]}" get namespace "$NS" -o name 2>&1); then :
+elif grep -qiE 'notfound|not found' <<<"$nsout"; then die "namespace '$NS' does not exist"
+fi   # any other error (e.g. forbidden to get namespaces) is ignored on purpose
+WHO=$(whoami_user)
+
+helm template "$RELEASE" "$CHART" -n "$NS" --include-crds ${HELM_ARGS[@]+"${HELM_ARGS[@]}"} >"$TMPDIR_/rendered.yaml" 2>"$TMPDIR_/helm.err" \
+  || die "helm template failed: $(<"$TMPDIR_/helm.err")"
+yq -o=json -I0 '.' "$TMPDIR_/rendered.yaml" 2>"$TMPDIR_/yq.err" \
+  | jq -c 'select(type == "object" and .kind != null)' >"$TMPDIR_/docs.jsonl" \
+  || die "could not parse rendered manifests"
+yq -s "\"$TMPDIR_/doc_\" + \$index + \".yml\"" "$TMPDIR_/rendered.yaml" >/dev/null 2>&1
+while IFS= read -r r; do CHART_ROLES[$r]=1; done < <(jq -r 'select(.kind == "Role" or .kind == "ClusterRole") | "\(.kind)/\(.metadata.name)"' "$TMPDIR_/docs.jsonl")
+while IFS=$'\t' read -r g k pl sc; do CHART_CRDS["$g/$k"]="$pl"$'\t'"$([[ $sc == Namespaced ]] && echo true || echo false)"; done \
+  < <(jq -r 'select(.kind == "CustomResourceDefinition") | [.spec.group, .spec.names.kind, .spec.names.plural, .spec.scope] | @tsv' "$TMPDIR_/docs.jsonl")
+while IFS= read -r r; do CHART_ROLES[$r]=1; done < <(jq -r 'select(.kind == "ServiceAccount") | "ServiceAccount/\(.metadata.name)"' "$TMPDIR_/docs.jsonl")
+NDOCS=$(wc -l <"$TMPDIR_/docs.jsonl" | tr -d ' ')
+
+while IFS= read -r doc; do
+  IFS=$'\t' read -r api kind name dns hook < <(jq -r --arg ns "$NS" '
+    [.apiVersion, .kind, (.metadata.name // "?"), (.metadata.namespace // $ns),
+     (.metadata.annotations["helm.sh/hook"] // "")] | @tsv' <<<"$doc")
+  group=""; [[ $api == */* ]] && group=${api%%/*}
+  label="$kind/$name"; [[ -n $hook ]] && label="$label (hook: $hook)"
+
+  disc=$(discovery "$api")
+  info=""
+  [[ $disc != NONE ]] && info=$(jq -r --arg k "$kind" 'map(select(.kind == $k)) | first // empty | "\(.name)\t\(.namespaced)"' <<<"$disc")
+  crdnote=""
+  if [[ -z $info && -n ${CHART_CRDS[$group/$kind]+x} ]]; then   # kind defined by a CRD shipped in this chart
+    info=${CHART_CRDS[$group/$kind]}; FROMCRD["$kind/$name"]=1; N_FROMCRD=$((N_FROMCRD + 1)); crdnote="kind defined by a CRD in this chart"
+  fi
+  if [[ -z $info ]]; then
+    add "$label" "$dns" - UNSUPPORTED "$api $kind is not served by this Supervisor"
+    UNSUP["$kind/$name"]=1
+    continue
+  fi
+  IFS=$'\t' read -r res namespaced <<<"$info"
+  rns=$dns; [[ $namespaced == true ]] || rns=-
+  for verb in "${VERBS[@]}"; do
+    add "$label" "$rns" "$verb" "$(st decide "$verb" "$res" "$group" "$dns" "$name" "$namespaced")" "$crdnote"
+  done
+  [[ $group == rbac.authorization.k8s.io ]] && escalation "$kind" "$name" "$dns" "$doc" "$namespaced"
+done <"$TMPDIR_/docs.jsonl"
+
+for verb in "${RELEASE_SECRET_VERBS[@]}"; do
+  add "Secret/sh.helm.release.v1.* (Helm release)" "$NS" "$verb" "$(st decide "$verb" secrets "" "$NS" "" true)"
+done
+
+DRY_OK=null; DRY_MSG=""; DRY_CAT=""
+if [[ $SKIP_DRY -eq 0 ]]; then
+  if scjson=$("${KUBECTL[@]}" get storageclass -o json 2>/dev/null); then
+    SC_LISTABLE=1
+    SC_NAMES=$(jq -r '.items[].metadata.name' <<<"$scjson")
+    jq -e 'any(.items[]; .metadata.annotations["storageclass.kubernetes.io/is-default-class"] == "true")' <<<"$scjson" >/dev/null && SC_HAS_DEFAULT=1
+  fi
+  server_check_all "$TMPDIR_"
+  if [[ $UPGRADE -eq 1 ]]; then hv=(upgrade --install); else hv=(install); fi
+  if DRY_OUT=$(helm "${hv[@]}" "$RELEASE" "$CHART" -n "$NS" --dry-run=server ${HELM_CTX[@]+"${HELM_CTX[@]}"} ${HELM_ARGS[@]+"${HELM_ARGS[@]}"} 2>&1); then
+    DRY_OK=true
+  else
+    DRY_OK=false; DRY_MSG=$(head -6 <<<"$DRY_OUT" | clean_err); DRY_CAT=$(classify "$DRY_MSG")
+  fi
+fi
+# Helm's own dry-run cannot map kinds from CRDs that the chart itself would install first.
+DRY_BLOCK=0; DRY_INCONCLUSIVE=false
+[[ $DRY_OK == false ]] && DRY_BLOCK=1
+if [[ $DRY_OK == false && $DRY_CAT == MISSING-CRD && $N_FROMCRD -gt 0 ]]; then
+  DRY_BLOCK=0; DRY_INCONCLUSIVE=true
+fi
+
+count() { printf '%s\n' "${RESULTS[@]}" | awk -F'\t' -v s="$1" '$4 == s' | wc -l | tr -d ' '; }
+scount() { [[ ${#SERVER_RESULTS[@]} -gt 0 ]] || { echo 0; return; }
+           printf '%s\n' "${SERVER_RESULTS[@]}" | awk -F'\t' -v s="$1" '$3 == s' | wc -l | tr -d ' '; }
+N_ALLOWED=$(count ALLOWED); N_DENIED=$(count DENIED); N_UNSUP=$(count UNSUPPORTED); N_WARN=$(count WARN)
+S_OK=$(scount OK); S_DENIED=$(scount DENIED); S_WARN=$(scount WARN); S_SKIP=$(scount SKIPPED)
+PASS=true
+{ [[ $N_DENIED -gt 0 || $N_UNSUP -gt 0 || $S_DENIED -gt 0 ]] || [[ $DRY_BLOCK -eq 1 ]]; } && PASS=false
+
+# Optional real deployment: only when --deploy was given AND every check passed.
+DEPLOY_STATE=not-requested; DEPLOY_OUT=""
+if [[ $DEPLOY -eq 1 ]]; then
+  if [[ $PASS == true && $DRY_INCONCLUSIVE == false ]]; then
+    if [[ $UPGRADE -eq 1 ]]; then hv=(upgrade --install); else hv=(install); fi
+    if DEPLOY_OUT=$(helm "${hv[@]}" "$RELEASE" "$CHART" -n "$NS" ${HELM_CTX[@]+"${HELM_CTX[@]}"} ${HELM_ARGS[@]+"${HELM_ARGS[@]}"} 2>&1); then
+      DEPLOY_STATE=deployed
+    else
+      DEPLOY_STATE=failed
+    fi
+  else
+    DEPLOY_STATE=skipped
+  fi
+fi
+
+if [[ $JSON -eq 1 ]]; then
+  srv='[]'
+  [[ ${#SERVER_RESULTS[@]} -gt 0 ]] && srv=$(printf '%s\n' "${SERVER_RESULTS[@]}" | jq -R -s -c '
+    split("\n") | map(select(length > 0) | split("\t")
+    | {resource: .[0], ns: .[1], result: .[2], category: .[3], message: (.[4] // "")})')
+  printf '%s\n' "${RESULTS[@]}" | jq -R -s --arg user "$WHO" --arg ns "$NS" --argjson pass "$PASS" \
+    --argjson dry "$DRY_OK" --arg dmsg "$DRY_MSG" --arg dcat "$DRY_CAT" --argjson srv "$srv" \
+    --arg dstate "$DEPLOY_STATE" --arg dout "$DEPLOY_OUT" --argjson inconc "$DRY_INCONCLUSIVE" '
+    {user: $user, namespace: $ns, pass: $pass,
+     results: (split("\n") | map(select(length > 0) | split("\t")
+               | {resource: .[0], ns: .[1], verb: .[2], status: .[3], note: (.[4] // "")})),
+     server_checks: $srv,
+     server_dry_run: {ok: $dry, inconclusive: $inconc, category: $dcat, output: ($dmsg | split("\n") | map(select(length > 0)))},
+     deploy: {state: $dstate, output: ($dout | split("\n") | map(select(length > 0)))}}'
+else
+  printf 'Identity : %s\nTarget   : namespace %s  (%s rendered objects)\n\n' "$WHO" "$NS" "$NDOCS"
+  { printf 'RESOURCE\tNAMESPACE\tVERB\tSTATUS\tNOTE\n'; printf '%s\n' "${RESULTS[@]}"; } | fmt_table
+  if [[ $SKIP_DRY -eq 0 ]]; then
+    printf '\nServer-side validation (each object dry-run separately; webhooks, policies, quota, Pod Security):\n'
+    { printf 'RESOURCE\tNAMESPACE\tRESULT\tCATEGORY\tMESSAGE\n'; printf '%s\n' "${SERVER_RESULTS[@]}"; } | fmt_table
+    if [[ $DRY_OK == true ]]; then printf '\nHelm dry-run: OK\n'
+    elif [[ $DRY_INCONCLUSIVE == true ]]; then
+      printf '\nHelm dry-run: INCONCLUSIVE [%s] (Helm cannot map kinds from this chart'"'"'s own CRDs before they exist; not counted as a failure)\n' "$DRY_CAT"
+    else printf '\nHelm dry-run: FAILED [%s]\n' "$DRY_CAT"; sed 's/^/  /' <<<"$DRY_MSG"; fi
+  fi
+  verdict=PASS; [[ $PASS == true ]] || verdict=FAIL
+  printf '\nRBAC     : %s allowed, %s denied, %s unsupported, %s warnings\n' \
+    "$N_ALLOWED" "$N_DENIED" "$N_UNSUP" "$N_WARN"
+  [[ $SKIP_DRY -eq 0 ]] && printf 'Server   : %s ok, %s denied, %s warnings, %s skipped\n' \
+    "$S_OK" "$S_DENIED" "$S_WARN" "$S_SKIP"
+  printf 'Result   : %s\n' "$verdict"
+  case $DEPLOY_STATE in
+    deployed) printf '\nDeploy   : DEPLOYED (%s in namespace %s)\n' "$RELEASE" "$NS"; sed 's/^/  /' <<<"$DEPLOY_OUT" ;;
+    failed)   printf '\nDeploy   : FAILED\n'; sed 's/^/  /' <<<"$DEPLOY_OUT" ;;
+    skipped)  if [[ $PASS == true ]]; then printf '\nDeploy   : SKIPPED (Helm dry-run was inconclusive, so the result is not fully validated)\n'
+            else printf '\nDeploy   : SKIPPED (result is not PASS)\n'; fi ;;
+  esac
+fi
+[[ $DEPLOY_STATE == failed ]] && exit 3
+[[ $PASS == true ]]
