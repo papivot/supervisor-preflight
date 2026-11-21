@@ -1,0 +1,11 @@
+# Third-party charts pulled for testing or the README examples (helm pull --untar -d charts)
+/charts/
+
+# Packaged charts
+*.tgz
+
+# Output of the CI example in the README
+result.json
+
+# macOS
+.DS_Store
