@@ -31,6 +31,15 @@ It never writes to the cluster unless you pass `--deploy`.
 | `jq` | any recent | |
 | `yq` | mikefarah v4 | not the Python `yq` |
 
+**macOS.** The system bash is 3.2, which is too old, and the script stops with exit code 2 and a message if it finds it. Install the requirements with Homebrew, then run the script with the new bash:
+
+```
+brew install bash yq jq helm kubectl
+"$(brew --prefix)/bin/bash" ./supervisor-preflight <chart> <release> ...
+```
+
+Or put `$(brew --prefix)/bin` first on your `PATH`, so that `#!/usr/bin/env bash` finds the new bash.
+
 You need a kube context for the Supervisor namespace you want to deploy to. List them with `kubectl config get-contexts`.
 
 ## Installation

@@ -8,6 +8,13 @@
 # 2 tool error, 3 checks passed but the deployment itself failed.
 set -uo pipefail
 
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+  echo "supervisor-preflight needs bash 4 or newer (this is ${BASH_VERSION:-unknown})." >&2
+  echo "On macOS the system bash is 3.2. Run: brew install bash" >&2
+  echo "Then: \$(brew --prefix)/bin/bash $0 <chart> <release> ..." >&2
+  exit 2
+fi
+
 usage() {
   cat <<EOF
 Usage: ${0##*/} <chart> <release> [-n namespace] [-f values.yaml]... [--set k=v]...
