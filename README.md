@@ -75,7 +75,7 @@ supervisor-preflight <chart> <release> [options]
 |---|---|
 | `<chart>` | Chart to check. |
 | `<release>` | Release name that the install would use. |
-| `-n`, `--namespace NS` | Target namespace. Default `demo1`. Must exist. |
+| `-n`, `--namespace NS` | Target namespace. Default: the namespace of the kube context (the `supervisor:<namespace>` contexts from `kubectl vsphere login` have one). The script exits with code 2 if there is neither. Must exist. |
 | `-f`, `--values FILE` | Values file. Repeatable; later files win. |
 | `--set k=v` | Override a single value. Repeatable; wins over `-f`. |
 | `--version V` | Chart version. |
@@ -104,7 +104,7 @@ A run prints an identity header, an RBAC table, a server-side table, the Helm dr
 
 ```
 Identity : sso:Administrator@vsphere.local
-Target   : namespace demo1  (7 rendered objects)
+Target   : namespace demo1 (from kube context)  (7 rendered objects)
 ...
 Helm dry-run: OK
 
@@ -183,7 +183,7 @@ helm pull oci://registry-1.docker.io/bitnamicharts/postgresql --untar -d charts
 ```
 $ supervisor-preflight charts/postgresql postgresql --kube-context supervisor:demo1
 Identity : sso:Administrator@vsphere.local
-Target   : namespace demo1  (7 rendered objects)
+Target   : namespace demo1 (from kube context)  (7 rendered objects)
 PVC/data-postgresql-0 (volumeClaimTemplate of StatefulSet/postgresql)  demo1      DENIED  STORAGECLASS  no StorageClass is set and the cluster has no…
 Helm dry-run: OK
 RBAC     : 12 allowed, 0 denied, 0 unsupported, 0 warnings
@@ -196,7 +196,7 @@ Result   : FAIL
 $ supervisor-preflight charts/postgresql postgresql --kube-context supervisor:demo1 \
     --set global.defaultStorageClass=vsan-default-storage-policy
 Identity : sso:Administrator@vsphere.local
-Target   : namespace demo1  (7 rendered objects)
+Target   : namespace demo1 (from kube context)  (7 rendered objects)
 PVC/data-postgresql-0 (volumeClaimTemplate of StatefulSet/postgresql)  demo1      OK      -         StorageClass vsan-default-storage-policy; accepte…
 Helm dry-run: OK
 RBAC     : 12 allowed, 0 denied, 0 unsupported, 0 warnings
@@ -229,7 +229,7 @@ helm pull oci://registry-1.docker.io/bitnamicharts/redis --untar -d charts
 ```
 $ supervisor-preflight charts/redis redis --kube-context supervisor:demo1
 Identity : sso:Administrator@vsphere.local
-Target   : namespace demo1  (14 rendered objects)
+Target   : namespace demo1 (from kube context)  (14 rendered objects)
 PVC/redis-data-redis-master-0 (volumeClaimTemplate of StatefulSet/redis-master)      demo1      DENIED  STORAGECLASS  no StorageClass is set and the …
 PVC/redis-data-redis-replicas-0 (volumeClaimTemplate of StatefulSet/redis-replicas)  demo1      DENIED  STORAGECLASS  no StorageClass is set and the …
 Helm dry-run: OK
@@ -243,7 +243,7 @@ Result   : FAIL
 $ supervisor-preflight charts/redis redis --kube-context supervisor:demo1 \
     --set global.defaultStorageClass=vsan-default-storage-policy
 Identity : sso:Administrator@vsphere.local
-Target   : namespace demo1  (14 rendered objects)
+Target   : namespace demo1 (from kube context)  (14 rendered objects)
 PVC/redis-data-redis-master-0 (volumeClaimTemplate of StatefulSet/redis-master)      demo1      OK      -         StorageClass vsan-default-storage-p…
 PVC/redis-data-redis-replicas-0 (volumeClaimTemplate of StatefulSet/redis-replicas)  demo1      OK      -         StorageClass vsan-default-storage-p…
 Helm dry-run: OK
@@ -275,7 +275,7 @@ helm pull grafana/grafana --untar -d charts
 ```
 $ supervisor-preflight charts/grafana grafana --kube-context supervisor:demo1
 Identity : sso:Administrator@vsphere.local
-Target   : namespace demo1  (12 rendered objects)
+Target   : namespace demo1 (from kube context)  (12 rendered objects)
 ClusterRole/grafana-clusterrole                demo1      DENIED  RBAC        clusterroles.rbac.authorization.k8s.io is forbidden: User "sso:Administ…
 ClusterRoleBinding/grafana-clusterrolebinding  demo1      DENIED  RBAC        clusterrolebindings.rbac.authorization.k8s.io is forbidden: User "sso:A…
 Helm dry-run: FAILED [RBAC]
@@ -293,7 +293,7 @@ printf 'rbac:\n  namespaced: true\n' > /tmp/grafana-override.yaml
 $ supervisor-preflight charts/grafana grafana --kube-context supervisor:demo1 \
     -f /tmp/grafana-override.yaml
 Identity : sso:Administrator@vsphere.local
-Target   : namespace demo1  (10 rendered objects)
+Target   : namespace demo1 (from kube context)  (10 rendered objects)
 Helm dry-run: OK
 RBAC     : 16 allowed, 0 denied, 0 unsupported, 1 warnings
 Server   : 8 ok, 0 denied, 2 warnings, 0 skipped
@@ -323,7 +323,7 @@ Then open `http://localhost:3000`. Persistence is off by default, so dashboards 
 $ supervisor-preflight charts/grafana grafana --kube-context supervisor:demo1 \
     -f /tmp/grafana-override.yaml --set service.type=LoadBalancer --upgrade
 Identity : sso:Administrator@vsphere.local
-Target   : namespace demo1  (10 rendered objects)
+Target   : namespace demo1 (from kube context)  (10 rendered objects)
 Helm dry-run: OK
 RBAC     : 56 allowed, 0 denied, 0 unsupported, 1 warnings
 Server   : 8 ok, 0 denied, 2 warnings, 0 skipped
@@ -343,7 +343,7 @@ helm pull headlamp/headlamp --untar -d charts
 ```
 $ supervisor-preflight charts/headlamp headlamp --kube-context supervisor:demo1
 Identity : sso:Administrator@vsphere.local
-Target   : namespace demo1  (5 rendered objects)
+Target   : namespace demo1 (from kube context)  (5 rendered objects)
 ClusterRoleBinding/headlamp-admin  demo1      DENIED  RBAC      clusterrolebindings.rbac.authorization.k8s.io is forbidden: User "sso:Administrator@v…
 Helm dry-run: FAILED [RBAC]
 RBAC     : 9 allowed, 1 denied, 0 unsupported, 1 warnings
@@ -360,7 +360,7 @@ printf 'clusterRoleBinding:\n  create: false\n' > /tmp/headlamp-override.yaml
 $ supervisor-preflight charts/headlamp headlamp --kube-context supervisor:demo1 \
     -f /tmp/headlamp-override.yaml
 Identity : sso:Administrator@vsphere.local
-Target   : namespace demo1  (4 rendered objects)
+Target   : namespace demo1 (from kube context)  (4 rendered objects)
 Helm dry-run: OK
 RBAC     : 9 allowed, 0 denied, 0 unsupported, 0 warnings
 Server   : 4 ok, 0 denied, 0 warnings, 0 skipped
@@ -450,7 +450,7 @@ Some charts cannot be deployed by a user with namespace-level rights, and no val
 ```
 $ supervisor-preflight charts/kube-prometheus-stack kps --kube-context supervisor:demo1 --deploy
 Identity : sso:Administrator@vsphere.local
-Target   : namespace demo1  (136 rendered objects)
+Target   : namespace demo1 (from kube context)  (136 rendered objects)
 ClusterRole/kps-kube-state-metrics  -  escalate-check  DENIED
 ClusterRole/kps-kube-prometheus-stack-operator  -  escalate-check  DENIED
 Alertmanager/kps-kube-prometheus-stack-alertmanager  demo1  create  DENIED

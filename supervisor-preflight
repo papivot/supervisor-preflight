@@ -24,7 +24,7 @@ EOF
   exit 2
 }
 
-NS=demo1; VALUES=(); SETS=(); VERSION=""; UPGRADE=0; CTX=""; SKIP_DRY=0; JSON=0; DEPLOY=0; POS=()
+NS=""; NS_SRC="-n option"; VALUES=(); SETS=(); VERSION=""; UPGRADE=0; CTX=""; SKIP_DRY=0; JSON=0; DEPLOY=0; POS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -n|--namespace) NS=${2:?}; shift 2 ;;
@@ -313,6 +313,11 @@ fmt_table() { # reads TSV (5 fields) on stdin; left-aligns the first four
 TMPDIR_=$(mktemp -d); trap 'rm -rf "$TMPDIR_"' EXIT
 
 # Preflight: can we reach the cluster, and does the namespace exist?
+if [[ -z $NS ]]; then
+  NS=$("${KUBECTL[@]}" config view --minify -o jsonpath='{..namespace}' 2>/dev/null)
+  NS_SRC="kube context"
+  [[ -n $NS ]] || die "no namespace given and kube context '${CTX:-<current>}' has none; pass -n <namespace> or run: kubectl config set-context --current --namespace=<namespace>"
+fi
 "${KUBECTL[@]}" get --raw /version >/dev/null 2>"$TMPDIR_/ping.err" \
   || die "cannot reach the cluster with kube context '${CTX:-<current>}': $(head -c 300 "$TMPDIR_/ping.err")"
 if nsout=$("${KUBECTL[@]}" get namespace "$NS" -o name 2>&1); then :
@@ -325,7 +330,9 @@ helm template "$RELEASE" "$CHART" -n "$NS" --include-crds ${HELM_ARGS[@]+"${HELM
 yq -o=json -I0 '.' "$TMPDIR_/rendered.yaml" 2>"$TMPDIR_/yq.err" \
   | jq -c 'select(type == "object" and .kind != null)' >"$TMPDIR_/docs.jsonl" \
   || die "could not parse rendered manifests"
-yq -s "\"$TMPDIR_/doc_\" + \$index + \".yml\"" "$TMPDIR_/rendered.yaml" >/dev/null 2>&1
+# Split inside the temp dir with relative names: newer yq refuses to write outside the current directory.
+( cd "$TMPDIR_" && yq -s '"doc_" + $index + ".yml"' rendered.yaml ) >/dev/null 2>"$TMPDIR_/split.err" \
+  || die "could not split the rendered chart: $(head -c 300 "$TMPDIR_/split.err")"
 while IFS= read -r r; do CHART_ROLES[$r]=1; done < <(jq -r 'select(.kind == "Role" or .kind == "ClusterRole") | "\(.kind)/\(.metadata.name)"' "$TMPDIR_/docs.jsonl")
 while IFS=$'\t' read -r g k pl sc; do CHART_CRDS["$g/$k"]="$pl"$'\t'"$([[ $sc == Namespaced ]] && echo true || echo false)"; done \
   < <(jq -r 'select(.kind == "CustomResourceDefinition") | [.spec.group, .spec.names.kind, .spec.names.plural, .spec.scope] | @tsv' "$TMPDIR_/docs.jsonl")
@@ -371,6 +378,8 @@ if [[ $SKIP_DRY -eq 0 ]]; then
     jq -e 'any(.items[]; .metadata.annotations["storageclass.kubernetes.io/is-default-class"] == "true")' <<<"$scjson" >/dev/null && SC_HAS_DEFAULT=1
   fi
   server_check_all "$TMPDIR_"
+  [[ $NDOCS -eq 0 || ${#SERVER_RESULTS[@]} -gt 0 ]] \
+    || die "server-side validation produced no results for $NDOCS rendered objects; refusing to report PASS"
   if [[ $UPGRADE -eq 1 ]]; then hv=(upgrade --install); else hv=(install); fi
   if DRY_OUT=$(helm "${hv[@]}" "$RELEASE" "$CHART" -n "$NS" --dry-run=server ${HELM_CTX[@]+"${HELM_CTX[@]}"} ${HELM_ARGS[@]+"${HELM_ARGS[@]}"} 2>&1); then
     DRY_OK=true
@@ -423,7 +432,7 @@ if [[ $JSON -eq 1 ]]; then
      server_dry_run: {ok: $dry, inconclusive: $inconc, category: $dcat, output: ($dmsg | split("\n") | map(select(length > 0)))},
      deploy: {state: $dstate, output: ($dout | split("\n") | map(select(length > 0)))}}'
 else
-  printf 'Identity : %s\nTarget   : namespace %s  (%s rendered objects)\n\n' "$WHO" "$NS" "$NDOCS"
+  printf 'Identity : %s\nTarget   : namespace %s (from %s)  (%s rendered objects)\n\n' "$WHO" "$NS" "$NS_SRC" "$NDOCS"
   { printf 'RESOURCE\tNAMESPACE\tVERB\tSTATUS\tNOTE\n'; printf '%s\n' "${RESULTS[@]}"; } | fmt_table
   if [[ $SKIP_DRY -eq 0 ]]; then
     printf '\nServer-side validation (each object dry-run separately; webhooks, policies, quota, Pod Security):\n'
