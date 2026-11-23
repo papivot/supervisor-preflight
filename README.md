@@ -531,7 +531,9 @@ Helm's own dry-run cannot map those kinds before the CRDs exist, so a `MISSING-C
 | `admission` | FAIL | an object that RBAC allows but the API server rejects as invalid |
 | `storage` | FAIL by default | a StatefulSet and a PVC without a StorageClass; pass `--set storageClass=<class>` to fix |
 
-Run one with, for example:
+`tests/bash-version.sh` checks that the script refuses to run on bash older than 4 and runs on bash 4+. It needs no cluster: run `tests/bash-version.sh`. It reports SKIP for a case when the machine has no matching bash.
+
+Run one chart with, for example:
 
 ```
 supervisor-preflight tests/storage st --kube-context supervisor:demo1
